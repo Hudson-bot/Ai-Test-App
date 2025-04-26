@@ -10,7 +10,13 @@ export default function QuizGenerator() {
   const [responses, setResponses] = useState([]);
   const [quizStarted, setQuizStarted] = useState(false);
   const [liveTranscript, setLiveTranscript] = useState('');
+  const [results, setResults] = useState([]);
+  const [showResults, setShowResults] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [timeLeft, setTimeLeft] = useState(60);
+  const [isListening, setIsListening] = useState(false);
   const recognitionRef = useRef(null);
+  const timerRef = useRef(null);
 
   const handleFileChange = (e) => {
     setResume(e.target.files[0]);
@@ -32,17 +38,13 @@ export default function QuizGenerator() {
         headers: { 'Content-Type': 'multipart/form-data' }
       });
 
-      if (!data.questions) {
-        throw new Error('No questions received from server');
-      }
+      if (!data.questions) throw new Error('No questions received from server');
 
       const qArray = data.questions
         .split('\n')
         .filter((q) => q.trim().length > 3);
 
-      if (qArray.length === 0) {
-        throw new Error('No valid questions generated');
-      }
+      if (qArray.length === 0) throw new Error('No valid questions generated');
 
       setQuestions(qArray);
       setQuizStarted(true);
@@ -56,7 +58,12 @@ export default function QuizGenerator() {
 
   const speak = (text) => {
     const utterance = new SpeechSynthesisUtterance(text);
-    speechSynthesis.cancel(); // stop previous speech
+    utterance.onstart = () => setIsSpeaking(true);
+    utterance.onend = () => {
+      setIsSpeaking(false);
+      setTimeout(startListening, 1000); // Start listening 1 second after speaking ends
+    };
+    speechSynthesis.cancel();
     speechSynthesis.speak(utterance);
   };
 
@@ -66,6 +73,9 @@ export default function QuizGenerator() {
       return;
     }
 
+    setIsListening(true);
+    setTimeLeft(60);
+
     if (recognitionRef.current) {
       recognitionRef.current.abort();
     }
@@ -74,6 +84,7 @@ export default function QuizGenerator() {
     const recognition = new SpeechRecognition();
     recognition.lang = 'en-US';
     recognition.interimResults = true;
+    recognition.continuous = true;
     recognition.maxAlternatives = 1;
 
     let finalTranscript = '';
@@ -83,59 +94,107 @@ export default function QuizGenerator() {
       for (let i = event.resultIndex; i < event.results.length; ++i) {
         const transcript = event.results[i][0].transcript;
         if (event.results[i].isFinal) {
-          finalTranscript += transcript;
+          finalTranscript = transcript;
         } else {
           interim += transcript;
         }
       }
-      setLiveTranscript(interim);
-
-      if (finalTranscript) {
-        setResponses((prev) => [...prev, finalTranscript]);
-        setLiveTranscript('');
-      }
-    };
-
-    recognition.onerror = (e) => {
-      console.error('Speech recognition error:', e.error);
-      setResponses((prev) => [...prev, '[Could not understand response]']);
-      setLiveTranscript('');
-    };
-
-    recognition.onend = () => {
-      if (!finalTranscript) {
-        setResponses((prev) => [...prev, '[Could not understand response]']);
-        setLiveTranscript('');
-      }
-
-      setTimeout(() => {
-        setCurrentQuestionIndex((prev) => prev + 1);
-      }, 1000);
+      setLiveTranscript(interim || finalTranscript);
     };
 
     recognition.start();
     recognitionRef.current = recognition;
+
+    // Start timer
+    timerRef.current = setInterval(() => {
+      setTimeLeft((prev) => {
+        if (prev <= 1) {
+          handleNextQuestion(finalTranscript);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  };
+
+  const handleNextQuestion = (transcript = '') => {
+    // Clear timer
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+    }
+    
+    // Stop recognition
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+    }
+
+    // Save response
+    setResponses((prev) => [...prev, transcript || liveTranscript || '[No answer provided]']);
+    setLiveTranscript('');
+    setIsListening(false);
+    
+    // Move to next question
+    setCurrentQuestionIndex((prev) => prev + 1);
   };
 
   useEffect(() => {
     if (quizStarted && currentQuestionIndex < questions.length) {
       const q = questions[currentQuestionIndex];
       speak(q);
-      setTimeout(startListening, 3000);
+    }
+
+    if (quizStarted && currentQuestionIndex === questions.length) {
+      // All questions done – submit for scoring
+      scoreResponses();
     }
   }, [currentQuestionIndex, quizStarted]);
+
+  const scoreResponses = async () => {
+    try {
+      const { data } = await axios.post('http://localhost:5000/api/score', {
+        questions,
+        answers: responses
+      });
+
+      if (!data.results) {
+        throw new Error('No results received');
+      }
+
+      setResults(data.results);
+      setShowResults(true);
+    } catch (err) {
+      console.error('Error scoring quiz:', err);
+      alert('Failed to score your answers. Please try again.');
+    }
+  };
+
+  const renderResults = () => (
+    <div>
+      <h2 className="text-xl font-bold mb-3">Results & Feedback 🧠</h2>
+      {results.map((result, i) => (
+        <div key={i} className="mb-4 border p-3 rounded bg-white shadow">
+          <p className="font-semibold text-blue-700 mb-1">Q{i + 1}: {result.question}</p>
+          <p className="text-gray-700 mb-1">Your Answer: {result.userAnswer}</p>
+          <p className="text-green-600 font-medium mb-1">
+            Score: {result.analysis.score}/10
+          </p>
+          <p className="text-sm text-gray-600 mb-1 italic">
+            Feedback: {result.analysis.feedback}
+          </p>
+          <p className="text-sm text-purple-700">
+            ✅ Ideal Answer: {result.analysis.correctAnswer}
+          </p>
+        </div>
+      ))}
+    </div>
+  );
 
   const renderQuizSection = () => {
     if (currentQuestionIndex >= questions.length) {
       return (
         <div>
           <h2 className="text-xl font-semibold mb-2">Quiz Completed 🎉</h2>
-          {questions.map((q, i) => (
-            <div key={i} className="mb-4">
-              <p className="font-bold">{q}</p>
-              <p className="text-sm text-gray-700">Your Answer: {responses[i]}</p>
-            </div>
-          ))}
+          {showResults ? renderResults() : <p>Analyzing your answers...</p>}
         </div>
       );
     }
@@ -144,7 +203,23 @@ export default function QuizGenerator() {
       <div>
         <h2 className="text-lg font-bold mb-2">Question {currentQuestionIndex + 1}</h2>
         <p className="mb-2">{questions[currentQuestionIndex]}</p>
-        <p className="text-sm text-gray-500 italic mb-1">Listening for your answer...</p>
+        {isSpeaking ? (
+          <p className="text-sm text-gray-500 italic mb-1">Please wait while the question is being read...</p>
+        ) : (
+          <div>
+            <p className="text-sm text-gray-500 italic mb-1">
+              {isListening ? `Time remaining: ${timeLeft}s` : 'Please speak your answer...'}
+            </p>
+            {isListening && (
+              <button
+                onClick={() => handleNextQuestion()}
+                className="bg-blue-500 text-white px-4 py-2 rounded mt-2"
+              >
+                Next Question →
+              </button>
+            )}
+          </div>
+        )}
         {liveTranscript && (
           <div className="border p-2 text-gray-800 bg-gray-100 rounded mb-2">
             <p className="text-sm">🗣️ <strong>Live:</strong> {liveTranscript}</p>
